@@ -339,7 +339,7 @@ def csv_col_identify(cols, client, model):
     
 def df_to_event_list(df, client_id, file_id, accountant_id):
     # Select required columns and convert to list of dicts
-    required_cols = ['Category', 'Confidence', 'Reason']
+    required_cols = ['Category', 'Confidence', 'Reason',  'Description', 'Amount', 'Date']
     event_list = df[required_cols].to_dict(orient='records')
 
     cat_id_map = fetch_supabase_cat_db()
@@ -356,9 +356,15 @@ def df_to_event_list(df, client_id, file_id, accountant_id):
         event['category_id'] = name_to_id_map[event['Category']]
         event['confidence'] = event['Confidence']
         event['reason'] = event['Reason']
+        event['tx_narration'] = event['Description']
+        event['tx_amount'] = event['Amount']
+        event['tx_timestamp'] = event['Date']
         del event['Category']
         del event['Confidence']
         del event['Reason']
+        del event['Description']
+        del event['Amount']
+        del event['Date']
     
     return event_list
 
