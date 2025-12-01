@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 from openai import OpenAI
@@ -15,7 +15,6 @@ import requests
 import asyncio
 import logging
 import io
-import logging
 import sys
 
 # Force logs to stdout and set formatting
@@ -24,16 +23,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-
-logger = logging.getLogger("app")  # or __name__
-
-# logging.basicConfig(
-#     level=logging.INFO,  # Set log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-#     format="%(asctime)s [%(levelname)s] %(message)s",
-# )
-# logger = logging.getLogger(__name__)
+logger = logging.getLogger("app")
 
 
+# -------------------- Helpers --------------------
 
 def safe_parse_json(raw):
     """
@@ -55,10 +48,12 @@ def safe_parse_json(raw):
         except:
             return None
 
+
 # --- Helper to chunk list ---
 def chunker(seq, size):
     for pos in range(0, len(seq), size):
         yield seq[pos:pos + size]
+
 
 # --- Count tokens function ---
 def count_tokens(prompt, model="gpt-4o-mini"):
@@ -69,64 +64,9 @@ def count_tokens(prompt, model="gpt-4o-mini"):
     return len(enc.encode(prompt))
 
 
-# --- Safe JSON parser (reuse) ---
-def safe_parse_json(raw):
-    import re, json
-    raw = raw.strip()
-    # Remove ```json or ``` markdown if present
-    raw = re.sub(r"^```json", "", raw)
-    raw = re.sub(r"```$", "", raw)
+# -------------------- Core processing functions --------------------
 
-    # Try normal parsing
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        # Quick fix: ensure ending ]
-        if raw.startswith("[") and not raw.endswith("]"):
-            raw += "]"
-        try:
-            return json.loads(raw)
-        except:
-            return None
-
-## new prompt
-
-# --- Helper to chunk list ---
-def chunker(seq, size):
-    for pos in range(0, len(seq), size):
-        yield seq[pos:pos + size]
-
-# --- Count tokens function ---
-def count_tokens(prompt, model="gpt-4o-mini"):
-    try:
-        enc = tiktoken.encoding_for_model(model)
-    except KeyError:
-        enc = tiktoken.get_encoding("cl100k_base")
-    return len(enc.encode(prompt))
-
-
-# --- Safe JSON parser (reuse) ---
-def safe_parse_json(raw):
-    import re, json
-    raw = raw.strip()
-    # Remove ```json or ``` markdown if present
-    raw = re.sub(r"^```json", "", raw)
-    raw = re.sub(r"```$", "", raw)
-
-    # Try normal parsing
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        # Quick fix: ensure ending ]
-        if raw.startswith("[") and not raw.endswith("]"):
-            raw += "]"
-        try:
-            return json.loads(raw)
-        except:
-            return None
-
-# --- Batch categorization function with confidence and date ---
-def categorize_transactions_batch(client, df, amount_threshold=100, batch_size=20, model="gpt-4o-mini", person_name='Abhishek', mobile_numbers = '7206527787'):
+def categorize_transactions_batch(client, df, amount_threshold=100, batch_size=20, model="gpt-4o-mini", person_name='Abhishek', mobile_numbers='7206527787'):
     """
     Categorize transactions using LLM in batches with confidence scores.
     Handles 'Narration', 'Credit Amount', 'Debit Amount', and 'Date' columns.
@@ -196,7 +136,7 @@ def categorize_transactions_batch(client, df, amount_threshold=100, batch_size=2
         """
 
         # Optional: print token length
-        prompt_length = count_tokens(prompt, model="gpt-4o-mini")
+        prompt_length = count_tokens(prompt, model=model)
         print("🔹 Prompt token length:", prompt_length)
         logger.info(f"Prompt length for main classifier call: {prompt_length}")
 
@@ -208,7 +148,6 @@ def categorize_transactions_batch(client, df, amount_threshold=100, batch_size=2
         )
 
         # Parse JSON output
-        # TODO: REMOVE THIS LOGGING
         logger.info(f"pdf to csv response: {response}")
         raw_output = response.choices[0].message.content
         logger.info("LLM response generated from main classifier")
@@ -225,6 +164,7 @@ def categorize_transactions_batch(client, df, amount_threshold=100, batch_size=2
 
     return results_df
 
+
 def extract_text(doc):
     all_lines = []
     for page in doc:
@@ -236,6 +176,7 @@ def extract_text(doc):
     extracted_text = "\n".join(all_lines)
     return extracted_text
 
+
 def download_file_from_s3(presigned_url):
     response = requests.get(presigned_url)
     if response.status_code != 200:
@@ -243,7 +184,7 @@ def download_file_from_s3(presigned_url):
 
     return response
 
-        
+
 def pdf_to_csv(file_response, client, model):
     pdf_bytes = file_response.content
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -267,14 +208,14 @@ def pdf_to_csv(file_response, client, model):
     prompt_length = count_tokens(prompt, model="gpt-4o-mini")
     print("🔹 Prompt token length:", prompt_length)
     logger.info("Prompt length for converting pdf to csv: {prompt_length}")
-    
+
     # Make the OpenAI API call
     response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=8000  
+        max_tokens=8000
     )
-    
+
     # Extract the CSV from the response
     csv_output = response.choices[0].message.content
     logger.info("LLM response generated for pdf to csv")
@@ -283,8 +224,9 @@ def pdf_to_csv(file_response, client, model):
         f.write(csv_output)
     df = pd.read_csv("bank_statement_parsed.csv")
     logger.info("PDF to csv file written and read to return df")
-    
+
     return df
+
 
 def csv_col_identify(cols, client, model):
     """
@@ -292,10 +234,6 @@ def csv_col_identify(cols, client, model):
     Handles 'Narration', 'Credit Amount', 'Debit Amount', and 'Date' columns.
     Returns a dictionary mapping each logical name to the actual column name.
     """
-
-    # Convert column list to string
-    # cols_str = ", ".join(cols)
-    
     prompt = f"""
     You are a bank statement structure identifier.
     Identify which columns from the list provided correspond to:
@@ -303,7 +241,7 @@ def csv_col_identify(cols, client, model):
       - 'Credit Amount' (incoming money)
       - 'Debit Amount' (outgoing money)
       - 'Date' (transaction date)
-    
+
     Rules:
     - If you are not sure, make the best guess based on column name semantics (e.g., "cr", "dr", "txn_date", "details", "withdraw", "deposit").
     - Return ONLY valid JSON with keys exactly as:
@@ -335,10 +273,11 @@ def csv_col_identify(cols, client, model):
         mapping = {}
 
     return mapping
-    
+
+
 def df_to_event_list(df, client_id, file_id, accountant_id):
     # Select required columns and convert to list of dicts
-    required_cols = ['Category', 'Confidence', 'Reason',  'Description', 'Amount', 'Date']
+    required_cols = ['Category', 'Confidence', 'Reason', 'Description', 'Amount', 'Date']
     event_list = df[required_cols].to_dict(orient='records')
 
     cat_id_map = fetch_supabase_cat_db()
@@ -351,7 +290,7 @@ def df_to_event_list(df, client_id, file_id, accountant_id):
         if event['Category'] not in name_to_id_map:
             res = upsert_category(event['Category'])
             name_to_id_map[event['Category']] = res[0]['id']
-            
+
         event['category_id'] = name_to_id_map[event['Category']]
         event['confidence'] = event['Confidence']
         event['reason'] = event['Reason']
@@ -364,8 +303,11 @@ def df_to_event_list(df, client_id, file_id, accountant_id):
         del event['Description']
         del event['Amount']
         del event['Date']
-    
+
     return event_list
+
+
+# -------------------- Webhook HMAC helpers & invoker --------------------
 
 def generate_hmac_sha256_signature(secret_key, message):
     # Convert both secret and message to bytes
@@ -376,19 +318,25 @@ def generate_hmac_sha256_signature(secret_key, message):
     signature = hmac.new(key_bytes, message_bytes, hashlib.sha256).hexdigest()
     return signature
 
+
 def invoke_webhook(event_list):
-    
     var_json = {"events": event_list}
-    
+
     logger.info("Starting invoke webhook")
     raw_json_string = json.dumps(var_json)
-    
-    webhook_url = "https://statement-classifier-one.vercel.app/api/transactions/webhook"
-    signature = generate_hmac_sha256_signature(os.getenv("WEBHOOK_SIGNATURE_KEY"), raw_json_string)
+
+    # Read target webhook URL from environment so you can change per-deploy
+    webhook_url = os.getenv("WEBHOOK_URL")
+
+    signature = generate_hmac_sha256_signature(os.getenv("WEBHOOK_SIGNATURE_KEY", ""), raw_json_string)
     headers = {"Content-Type": "application/json", "x-signature": signature}
 
-    logger.info("Invoking webhook event")
-    response = requests.post(webhook_url, data=raw_json_string, headers=headers)
+    logger.info("Invoking webhook event to %s", webhook_url)
+    try:
+        response = requests.post(webhook_url, data=raw_json_string, headers=headers, timeout=30)
+    except Exception as e:
+        logger.error("Exception while invoking webhook: %s", str(e))
+        return
 
     if response.status_code == 200:
         logger.info("Webhook success")
@@ -397,6 +345,8 @@ def invoke_webhook(event_list):
         logger.error(f"Webhook invocation failed with status code {response.status_code} - Response: {response.text}")
         print(f"Webhook invocation failed: {response.status_code} - {response.text}")
 
+
+# -------------------- FastAPI app & routes --------------------
 
 app = FastAPI()
 # Enable CORS
@@ -413,16 +363,19 @@ app.add_middleware(
 def read_root():
     return {"message": "Hello World"}
 
+
 @app.get("/hello")
 def say_hello():
     return {"message": "Hello from the named API!"}
+
 
 class ClassifierRequest(BaseModel):
     client_id: str
     signed_url: str
     file_id: str
     accountant_id: str
-    
+
+
 @app.post("/classifier")
 async def classifier_api(request: ClassifierRequest):
     file_list = []
@@ -435,20 +388,21 @@ async def classifier_api(request: ClassifierRequest):
     asyncio.create_task(classifier_main(file_list, client_info['first_name'], client_info['phone_number'], request.client_id, request.file_id, request.accountant_id))
     # return true or false
     return True
-    
+
+
 async def classifier_main(file_list, name, mob_no, client_id, file_id, accountant_id):
-    res_final = pd.DataFrame() 
+    res_final = pd.DataFrame()
     ## deepseek
     client = OpenAI(
-        base_url= "https://api.deepseek.com",
-        api_key= os.getenv("OPENAI_API_KEY"), # Deepseek free chat
+        base_url="https://api.deepseek.com",
+        api_key=os.getenv("OPENAI_API_KEY"),  # Deepseek free chat
     )
     model = "deepseek-chat"
 
     for file in file_list:
         if "pdf" in file.headers.get("Content-Type", ""):
             df = pdf_to_csv(file, client, model)
-            res = categorize_transactions_batch(client, df, amount_threshold=150, batch_size=50, model = model, person_name=name, mobile_numbers = mob_no)
+            res = categorize_transactions_batch(client, df, amount_threshold=150, batch_size=50, model=model, person_name=name, mobile_numbers=mob_no)
         else:
             df = pd.read_csv(io.StringIO(file.content.decode('utf-8')))
             ## columns intent
@@ -457,11 +411,11 @@ async def classifier_main(file_list, name, mob_no, client_id, file_id, accountan
             df = df.rename(columns=map)
             # Step 2: Keep only columns present in mapping
             df = df[[col for col in map.values() if col in df.columns]]
-            res = categorize_transactions_batch(client, df, amount_threshold=150, batch_size=50, model = model, person_name=name, mobile_numbers = mob_no)
-            
+            res = categorize_transactions_batch(client, df, amount_threshold=150, batch_size=50, model=model, person_name=name, mobile_numbers=mob_no)
+
         res_final = pd.concat([res_final, res], ignore_index=True)
-            
-    
+
+
     # convert response to webhook event type
     # invoke webhook event
     logger.info("LLM invocation done. Converting df to event list")
@@ -470,3 +424,37 @@ async def classifier_main(file_list, name, mob_no, client_id, file_id, accountan
 
     return res_final
 
+
+# -------------------- NEW WEBHOOK RECEIVER ENDPOINT --------------------
+
+@app.post("/transactions/webhook")
+async def webhook_events(request: Request):
+    """
+    Receiver endpoint for webhooks.
+    Expects HMAC SHA256 signature in `x-signature` header and JSON body.
+    """
+    body = await request.body()
+    signature = request.headers.get("x-signature")
+
+    expected = generate_hmac_sha256_signature(os.getenv("WEBHOOK_SIGNATURE_KEY", ""), body.decode())
+
+    if not signature or signature != expected:
+        logger.error("Invalid or missing signature for incoming webhook")
+        return {"status": "invalid signature"}
+
+    try:
+        data = json.loads(body)
+    except Exception as e:
+        logger.error("Failed to parse incoming webhook JSON: %s", str(e))
+        return {"status": "invalid json"}
+
+    logger.info("📩 Received webhook: %s", data)
+
+    # TODO: process webhook payload and insert into your Supabase DB if needed.
+    # Example:
+    # supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    # supabase_client.table("transactions").insert(data).execute()
+
+    return {"status": "success"}
+
+# ----------------------------------------------------------------------------- #
