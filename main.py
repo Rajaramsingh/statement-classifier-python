@@ -453,6 +453,9 @@ async def webhook_events(request: Request):
     except Exception as e:
         logger.error("Failed to parse incoming webhook JSON: %s", str(e))
         return {"status": "invalid json"}
+    logger.info("Received %d events", len(events))
+
+         
 
     rows = []
     for event in events:
@@ -474,9 +477,14 @@ async def webhook_events(request: Request):
         })
 
     if not rows:
+        logger.info("No rows to insert")
         return {"status": "no events"}
 
-    resp = supabase.table("transactions").insert(rows).execute()
+    resp = supabase.table("transactions").insert(rows).execute() 
+
+    logger.info("Insert response: %s", resp)
+      
+    
 
     if resp.get("error"):
         logger.error("Failed to insert transactions: %s", resp["error"])
