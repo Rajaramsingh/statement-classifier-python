@@ -16,6 +16,15 @@ import asyncio
 import logging
 import io
 import sys
+from dotenv import load_dotenv
+load_dotenv()
+
+
+from supabase import create_client  # add this import
+
+SUPABASE_URL = "https://tmpsadthcxvqtdbtslgq.supabase.co"
+SUPABASE_KEY = os.getenv("SUPABASE_PRIVATE_KEY")
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Force logs to stdout and set formatting
 logging.basicConfig(
@@ -326,7 +335,8 @@ def invoke_webhook(event_list):
     raw_json_string = json.dumps(var_json)
 
     # Read target webhook URL from environment so you can change per-deploy
-    webhook_url = os.getenv("WEBHOOK_URL")
+    webhook_url = "https://statement-classifier-python-2.onrender.com/transactions/webhook"
+
 
     signature = generate_hmac_sha256_signature(os.getenv("WEBHOOK_SIGNATURE_KEY", ""), raw_json_string)
     headers = {"Content-Type": "application/json", "x-signature": signature}
@@ -429,13 +439,8 @@ async def classifier_main(file_list, name, mob_no, client_id, file_id, accountan
 
 @app.post("/transactions/webhook")
 async def webhook_events(request: Request):
-    """
-    Receiver endpoint for webhooks.
-    Expects HMAC SHA256 signature in `x-signature` header and JSON body.
-    """
     body = await request.body()
     signature = request.headers.get("x-signature")
-
     expected = generate_hmac_sha256_signature(os.getenv("WEBHOOK_SIGNATURE_KEY", ""), body.decode())
 
     if not signature or signature != expected:
@@ -444,17 +449,38 @@ async def webhook_events(request: Request):
 
     try:
         data = json.loads(body)
+        events = data.get("events", [])
     except Exception as e:
         logger.error("Failed to parse incoming webhook JSON: %s", str(e))
         return {"status": "invalid json"}
 
-    logger.info("📩 Received webhook: %s", data)
+    rows = []
+    for event in events:
+        amount = event["tx_amount"]
+        tx_type = "income" if amount > 0 else "expense" if amount < 0 else "transfer"
 
-    # TODO: process webhook payload and insert into your Supabase DB if needed.
-    # Example:
-    # supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    # supabase_client.table("transactions").insert(data).execute()
+        rows.append({
+            "user_id": event["client_id"],
+            "source": "statement",
+            "amount": amount,
+            "currency": "INR",
+            "type": tx_type,
+            "raw_description": event["tx_narration"],
+              "merchant": None, 
+            "status": "final",
+            "category_ai_id": event["category_id"],
+             "category_user_id": None,   
+            "occurred_at": event["tx_timestamp"],
+        })
+
+    if not rows:
+        return {"status": "no events"}
+
+    resp = supabase.table("transactions").insert(rows).execute()
+
+    if resp.get("error"):
+        logger.error("Failed to insert transactions: %s", resp["error"])
+        return {"status": "error"}
 
     return {"status": "success"}
-
 # ----------------------------------------------------------------------------- #

@@ -15,6 +15,8 @@ def fetch_supabase_db(client_id):
   if response.data:
     client_info = response.data[0]
     return client_info
+  
+  
   else:
     return -1;
 
