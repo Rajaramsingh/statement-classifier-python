@@ -396,9 +396,9 @@ async def classifier_api(request: ClassifierRequest):
     # fetch client info from supabase db
     client_info = fetch_supabase_db(request.client_id)
     # call classifier_main - async call
-    asyncio.create_task(classifier_main(file_list, client_info['first_name'], client_info['phone_number'], request.client_id, request.file_id, request.accountant_id))
+    await classifier_main(file_list, client_info['first_name'], client_info['phone_number'], request.client_id, request.file_id, request.accountant_id)
     # return true or false
-    return True
+    return {"status": "completed"}
 
 
 async def classifier_main(file_list, name, mob_no, client_id, file_id, accountant_id):
@@ -498,7 +498,7 @@ async def webhook_events(request: Request):
         logger.info("No rows to insert")
         return {"status": "no events"}
 
-    resp = supabase.table("transactions").insert(rows).execute()
+    resp = supabase.table("transactions").upsert(rows).execute()
     logger.info("Insert response: %s", resp)
 
     if resp.get("error"):
