@@ -17,6 +17,8 @@ import logging
 import io
 import sys
 from datetime import datetime
+from typing import Optional
+
 from dotenv import load_dotenv # for access .env folder
 load_dotenv()
 
@@ -384,7 +386,7 @@ class ClassifierRequest(BaseModel):
     client_id: str
     signed_url: str
     file_id: str
-    accountant_id: str
+    accountant_id: Optional[str] = None
 
 
 @app.post("/classifier")
