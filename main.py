@@ -575,6 +575,10 @@ async def classifier_main(file_list, name, mob_no, client_id, accountant_id, imp
 
 # -------------------- NEW WEBHOOK RECEIVER ENDPOINT --------------------
 
+# ============================================================================
+# ✅ FIXED: Webhook endpoint with deduplication logic
+# ============================================================================
+
 @app.post("/transactions/webhook")
 async def webhook_events(request: Request):
     body = await request.body()
@@ -595,6 +599,7 @@ async def webhook_events(request: Request):
     logger.info("Received %d events", len(events))
 
     rows = []
+    rows_to_insert = []
 
     # ---- FIXED LOOP ----
     for event in events:
@@ -614,7 +619,7 @@ async def webhook_events(request: Request):
 
         occurred_at = dt.strftime("%Y-%m-%d")
 
-        rows.append({
+        transaction_data = {
             "user_id": event["client_id"],
             "source": "statement",
             "amount": amount,
@@ -626,19 +631,74 @@ async def webhook_events(request: Request):
             "category_ai_id": event["category_id"],
             "category_user_id": None,
             "occurred_at": occurred_at,
-        })
+        }
+        
+        rows.append(transaction_data)
 
     # After loop completes
     if not rows:
         logger.info("No rows to insert")
         return {"status": "no events"}
 
-    resp = supabase.table("transactions").insert(rows).execute()
-    logger.info("Insert response: %s", resp)
+    # ✅ NEW: Check for existing transactions before inserting
+    logger.info(f"Checking for duplicates among {len(rows)} transactions")
+    
+    for row in rows:
+        # Check if transaction already exists
+        # Match by: user_id, raw_description, amount, occurred_at, source
+        existing = supabase.table("transactions").select("id").eq("user_id", row["user_id"]).eq("raw_description", row["raw_description"]).eq("amount", row["amount"]).eq("occurred_at", row["occurred_at"]).eq("source", "statement").execute()
+        
+        if existing.data and len(existing.data) > 0:
+            # Transaction already exists - skip or update
+            existing_id = existing.data[0]["id"]
+            logger.info(f"⚠️ Duplicate transaction found (ID: {existing_id}). Skipping insertion.")
+            logger.info(f"   Details: {row['raw_description'][:50]}... | Amount: {row['amount']} | Date: {row['occurred_at']}")
+            
+            # ✅ OPTIONAL: Update existing transaction if category_ai_id changed
+            # Only update if category_ai_id is different and category_user_id is still null
+            # (Don't overwrite user's manual category assignment)
+            try:
+                existing_tx = supabase.table("transactions").select("category_ai_id, category_user_id").eq("id", existing_id).execute()
+                if existing_tx.data:
+                    existing_cat_ai = existing_tx.data[0].get("category_ai_id")
+                    existing_cat_user = existing_tx.data[0].get("category_user_id")
+                    
+                    # Only update if:
+                    # 1. category_ai_id is different AND
+                    # 2. category_user_id is null (user hasn't manually set a category)
+                    if existing_cat_ai != row["category_ai_id"] and existing_cat_user is None:
+                        supabase.table("transactions").update({
+                            "category_ai_id": row["category_ai_id"]
+                        }).eq("id", existing_id).execute()
+                        logger.info(f"✅ Updated category_ai_id for existing transaction {existing_id}")
+            except Exception as update_error:
+                logger.warning(f"Could not update existing transaction: {update_error}")
+        else:
+            # Transaction doesn't exist - add to insert list
+            rows_to_insert.append(row)
 
-    if resp.get("error"):
-        logger.error("Failed to insert transactions: %s", resp["error"])
-        return {"status": "error"}
+    # Only insert new transactions
+    if not rows_to_insert:
+        logger.info("All transactions already exist. No new transactions to insert.")
+        return {"status": "success", "message": "All transactions already exist", "skipped": len(rows), "inserted": 0}
 
-    return {"status": "success"}
+    logger.info(f"Inserting {len(rows_to_insert)} new transactions (skipped {len(rows) - len(rows_to_insert)} duplicates)")
+    
+    try:
+        resp = supabase.table("transactions").insert(rows_to_insert).execute()
+        logger.info(f"✅ Successfully inserted {len(rows_to_insert)} transactions")
+        
+        if resp.get("error"):
+            logger.error("Failed to insert transactions: %s", resp["error"])
+            return {"status": "error", "message": str(resp["error"])}
+        
+        return {
+            "status": "success",
+            "inserted": len(rows_to_insert),
+            "skipped": len(rows) - len(rows_to_insert)
+        }
+    except Exception as insert_error:
+        logger.error(f"Exception during insert: {insert_error}")
+        return {"status": "error", "message": str(insert_error)}
+
 
