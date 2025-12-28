@@ -38,9 +38,7 @@ logging.basicConfig(
 logger = logging.getLogger("app")
 
 
-# ============================================================================
 # ✅ NEW FUNCTION: Update statement status in Supabase
-# ============================================================================
 def update_statement_status(import_id: str, status: str, error: str = None, processor_job_id: str = None):
     """
     Update statement_imports table status column in Supabase.
@@ -114,7 +112,7 @@ def count_tokens(prompt, model="gpt-4o-mini"):
     return len(enc.encode(prompt))
 
 
-# -------------------- Core processing functions --------------------
+# Core processing functions 
 
 def categorize_transactions_batch(client, df, amount_threshold=100, batch_size=20, model="gpt-4o-mini", person_name='Abhishek', mobile_numbers='7206527787'):
     """
@@ -325,10 +323,12 @@ def csv_col_identify(cols, client, model):
     return mapping
 
 
-def df_to_event_list(df, client_id, accountant_id):
+
+# ✅ FIXED: df_to_event_list - Now includes file_id parameter
+def df_to_event_list(df, client_id, accountant_id, file_id=None):
     """
     Convert DataFrame to event list for webhook.
-    Removed file_id parameter as it's no longer needed.
+    Now includes file_id to link transactions to statement file.
     """
     # Select required columns and convert to list of dicts
     required_cols = ['Category', 'Confidence', 'Reason', 'Description', 'Amount', 'Date']
@@ -336,10 +336,12 @@ def df_to_event_list(df, client_id, accountant_id):
 
     cat_id_map = fetch_supabase_cat_db()
     name_to_id_map = {item['name']: item['id'] for item in cat_id_map}
+    
     # Add additional info to each event object
     for event in event_list:
         event['client_id'] = client_id
         event['accountant_id'] = accountant_id
+        event['file_id'] = file_id  # ✅ NEW: Add file_id to link to statement file
         if event['Category'] not in name_to_id_map:
             res = upsert_category(event['Category'])
             name_to_id_map[event['Category']] = res[0]['id']
@@ -360,7 +362,7 @@ def df_to_event_list(df, client_id, accountant_id):
     return event_list
 
 
-# -------------------- Webhook HMAC helpers & invoker --------------------
+#Webhook HMAC helpers & invoker
 
 def generate_hmac_sha256_signature(secret_key, message):
     # Convert both secret and message to bytes
@@ -423,9 +425,8 @@ def say_hello():
     return {"message": "Hello from the named API!"}
 
 
-# ============================================================================
 # ✅ UPDATED: ClassifierRequest - Removed file_id field
-# ============================================================================
+
 class ClassifierRequest(BaseModel):
     import_id: Optional[str] = None  # ✅ import_id from statement_imports table
     client_id: str
@@ -440,7 +441,6 @@ class ClassifierRequest(BaseModel):
 async def classifier_api(request: ClassifierRequest):
     """
     ✅ UPDATED: Now handles status updates throughout the processing lifecycle
-    Removed file_id from processing
     """
     import_id = request.import_id
     client_id = request.client_id or request.user_id  # Support both field names
@@ -499,15 +499,17 @@ async def classifier_api(request: ClassifierRequest):
         return {"status": "error", "message": error_msg}
 
 
-# ============================================================================
-# ✅ UPDATED: classifier_main - Removed file_id parameter
-# ============================================================================
+# ✅ FIXED: classifier_main - Now passes file_id to df_to_event_list
+
 async def classifier_main(file_list, name, mob_no, client_id, accountant_id, import_id=None):
     """
     ✅ UPDATED: Now accepts import_id and updates status to 'completed' or 'failed'
-    Removed file_id parameter as it's no longer needed
+    Note: API parameter is import_id, but internally we use file_id for clarity
     """
     res_final = pd.DataFrame()
+    
+    # Convert import_id to file_id for clarity (easier to understand)
+    file_id = import_id
     
     try:
         ## deepseek
@@ -551,7 +553,7 @@ async def classifier_main(file_list, name, mob_no, client_id, accountant_id, imp
         # convert response to webhook event type
         # invoke webhook event
         logger.info("LLM invocation done. Converting df to event list")
-        event_list = df_to_event_list(res_final, client_id, accountant_id)  # ✅ Removed file_id
+        event_list = df_to_event_list(res_final, client_id, accountant_id, file_id)  # ✅ Pass file_id
         invoke_webhook(event_list)
 
         # ✅ NEW: Update status to 'completed' after successful processing
@@ -573,11 +575,8 @@ async def classifier_main(file_list, name, mob_no, client_id, accountant_id, imp
         raise  # Re-raise the exception
 
 
-# -------------------- NEW WEBHOOK RECEIVER ENDPOINT --------------------
-
-# ============================================================================
-# ✅ FIXED: Webhook endpoint with deduplication logic
-# ============================================================================
+# NEW WEBHOOK RECEIVER ENDPOINT
+# ✅ FIXED: Webhook endpoint with deduplication logic and file_id support
 
 @app.post("/transactions/webhook")
 async def webhook_events(request: Request):
@@ -630,6 +629,7 @@ async def webhook_events(request: Request):
             "status": "final",
             "category_ai_id": event["category_id"],
             "category_user_id": None,
+            "statement_import_id": event.get("file_id"),  # ✅ NEW: Link to statement file (file_id)
             "occurred_at": occurred_at,
         }
         
@@ -640,41 +640,52 @@ async def webhook_events(request: Request):
         logger.info("No rows to insert")
         return {"status": "no events"}
 
-    # ✅ NEW: Check for existing transactions before inserting
-    logger.info(f"Checking for duplicates among {len(rows)} transactions")
+    # ✅ FIXED: Check for duplicates based on file_id (statement_import_id)
+    
+    logger.info(f"Checking for duplicates among {len(rows)} transactions (using file_id)")
     
     for row in rows:
-        # Check if transaction already exists
-        # Match by: user_id, raw_description, amount, occurred_at, source
-        existing = supabase.table("transactions").select("id").eq("user_id", row["user_id"]).eq("raw_description", row["raw_description"]).eq("amount", row["amount"]).eq("occurred_at", row["occurred_at"]).eq("source", "statement").execute()
+        file_id = row.get("statement_import_id")
+        
+        # Build query to check for existing transaction
+        # Match by: statement_import_id (file_id), user_id, raw_description, amount, occurred_at
+        query = supabase.table("transactions").select("id, category_ai_id, category_user_id").eq("user_id", row["user_id"]).eq("raw_description", row["raw_description"]).eq("amount", row["amount"]).eq("occurred_at", row["occurred_at"]).eq("source", "statement")
+        
+        # ✅ KEY FIX: Only check for duplicates from the SAME statement file (file_id)
+        if file_id:
+            query = query.eq("statement_import_id", file_id)
+        else:
+            # If file_id is missing, fallback to old logic (but log a warning)
+            logger.warning(f"⚠️ Transaction missing file_id (statement_import_id). Using fallback deduplication.")
+        
+        existing = query.execute()
         
         if existing.data and len(existing.data) > 0:
-            # Transaction already exists - skip or update
+            # Transaction already exists from the SAME statement file - skip insertion
             existing_id = existing.data[0]["id"]
-            logger.info(f"⚠️ Duplicate transaction found (ID: {existing_id}). Skipping insertion.")
+            logger.info(f"⚠️ Duplicate transaction found from same file (ID: {existing_id}, file_id: {file_id}). Skipping insertion.")
             logger.info(f"   Details: {row['raw_description'][:50]}... | Amount: {row['amount']} | Date: {row['occurred_at']}")
             
             # ✅ OPTIONAL: Update existing transaction if category_ai_id changed
             # Only update if category_ai_id is different and category_user_id is still null
             # (Don't overwrite user's manual category assignment)
             try:
-                existing_tx = supabase.table("transactions").select("category_ai_id, category_user_id").eq("id", existing_id).execute()
-                if existing_tx.data:
-                    existing_cat_ai = existing_tx.data[0].get("category_ai_id")
-                    existing_cat_user = existing_tx.data[0].get("category_user_id")
-                    
-                    # Only update if:
-                    # 1. category_ai_id is different AND
-                    # 2. category_user_id is null (user hasn't manually set a category)
-                    if existing_cat_ai != row["category_ai_id"] and existing_cat_user is None:
-                        supabase.table("transactions").update({
-                            "category_ai_id": row["category_ai_id"]
-                        }).eq("id", existing_id).execute()
-                        logger.info(f"✅ Updated category_ai_id for existing transaction {existing_id}")
+                existing_cat_ai = existing.data[0].get("category_ai_id")
+                existing_cat_user = existing.data[0].get("category_user_id")
+                
+                # Only update if:
+                # 1. category_ai_id is different AND
+                # 2. category_user_id is null (user hasn't manually set a category)
+                if existing_cat_ai != row["category_ai_id"] and existing_cat_user is None:
+                    supabase.table("transactions").update({
+                        "category_ai_id": row["category_ai_id"]
+                    }).eq("id", existing_id).execute()
+                    logger.info(f"✅ Updated category_ai_id for existing transaction {existing_id}")
             except Exception as update_error:
                 logger.warning(f"Could not update existing transaction: {update_error}")
         else:
-            # Transaction doesn't exist - add to insert list
+            # Transaction doesn't exist from this statement file - add to insert list
+            # (Even if same transaction exists from a different file, this is valid)
             rows_to_insert.append(row)
 
     # Only insert new transactions
@@ -700,5 +711,4 @@ async def webhook_events(request: Request):
     except Exception as insert_error:
         logger.error(f"Exception during insert: {insert_error}")
         return {"status": "error", "message": str(insert_error)}
-
 
