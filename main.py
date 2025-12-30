@@ -576,8 +576,7 @@ async def classifier_main(file_list, name, mob_no, client_id, accountant_id, imp
 
 
 # NEW WEBHOOK RECEIVER ENDPOINT
-# ✅ FIXED: Webhook endpoint with deduplication logic and file_id support
-
+# UPDATED: Webhook endpoint with GLOBAL deduplication logic
 @app.post("/transactions/webhook")
 async def webhook_events(request: Request):
     body = await request.body()
@@ -600,7 +599,7 @@ async def webhook_events(request: Request):
     rows = []
     rows_to_insert = []
 
-    # ---- FIXED LOOP ----
+    # ---- Process events ----
     for event in events:
         amount = event["tx_amount"]
         tx_type = "income" if amount > 0 else "expense" if amount < 0 else "transfer"
@@ -629,7 +628,7 @@ async def webhook_events(request: Request):
             "status": "final",
             "category_ai_id": event["category_id"],
             "category_user_id": None,
-            "statement_import_id": event.get("file_id"),  # ✅ NEW: Link to statement file (file_id)
+            "statement_import_id": event.get("file_id"),  # ✅ Store file_id for tracking
             "occurred_at": occurred_at,
         }
         
@@ -640,30 +639,31 @@ async def webhook_events(request: Request):
         logger.info("No rows to insert")
         return {"status": "no events"}
 
-    # ✅ FIXED: Check for duplicates based on file_id (statement_import_id)
-    
-    logger.info(f"Checking for duplicates among {len(rows)} transactions (using file_id)")
+    # ✅ UPDATED: GLOBAL deduplication - Check across ALL statement files
+    # This prevents duplicate transactions when users upload overlapping statements
+    logger.info(f"Checking for duplicates among {len(rows)} transactions (GLOBAL check across all files)")
     
     for row in rows:
         file_id = row.get("statement_import_id")
         
-        # Build query to check for existing transaction
-        # Match by: statement_import_id (file_id), user_id, raw_description, amount, occurred_at
-        query = supabase.table("transactions").select("id, category_ai_id, category_user_id").eq("user_id", row["user_id"]).eq("raw_description", row["raw_description"]).eq("amount", row["amount"]).eq("occurred_at", row["occurred_at"]).eq("source", "statement")
-        
-        # ✅ KEY FIX: Only check for duplicates from the SAME statement file (file_id)
-        if file_id:
-            query = query.eq("statement_import_id", file_id)
-        else:
-            # If file_id is missing, fallback to old logic (but log a warning)
-            logger.warning(f"⚠️ Transaction missing file_id (statement_import_id). Using fallback deduplication.")
+        # ✅ KEY CHANGE: Check for duplicates GLOBALLY (remove file_id filter)
+        # Match by: user_id, raw_description, amount, occurred_at, source
+        # This ensures the same transaction from different statement files is only stored once
+        query = supabase.table("transactions").select("id, category_ai_id, category_user_id, statement_import_id").eq("user_id", row["user_id"]).eq("raw_description", row["raw_description"]).eq("amount", row["amount"]).eq("occurred_at", row["occurred_at"]).eq("source", "statement")
         
         existing = query.execute()
         
         if existing.data and len(existing.data) > 0:
-            # Transaction already exists from the SAME statement file - skip insertion
+            # Transaction already exists (from any statement file) - skip insertion
             existing_id = existing.data[0]["id"]
-            logger.info(f"⚠️ Duplicate transaction found from same file (ID: {existing_id}, file_id: {file_id}). Skipping insertion.")
+            existing_file_id = existing.data[0].get("statement_import_id")
+            
+            # Log whether it's from the same file or different file
+            if existing_file_id == file_id:
+                logger.info(f"⚠️ Duplicate transaction found from SAME file (ID: {existing_id}, file_id: {file_id}). Skipping insertion.")
+            else:
+                logger.info(f"⚠️ Duplicate transaction found from DIFFERENT file (ID: {existing_id}, existing_file_id: {existing_file_id}, new_file_id: {file_id}). Skipping insertion.")
+            
             logger.info(f"   Details: {row['raw_description'][:50]}... | Amount: {row['amount']} | Date: {row['occurred_at']}")
             
             # ✅ OPTIONAL: Update existing transaction if category_ai_id changed
@@ -684,8 +684,7 @@ async def webhook_events(request: Request):
             except Exception as update_error:
                 logger.warning(f"Could not update existing transaction: {update_error}")
         else:
-            # Transaction doesn't exist from this statement file - add to insert list
-            # (Even if same transaction exists from a different file, this is valid)
+            # Transaction doesn't exist globally - add to insert list
             rows_to_insert.append(row)
 
     # Only insert new transactions
@@ -711,4 +710,3 @@ async def webhook_events(request: Request):
     except Exception as insert_error:
         logger.error(f"Exception during insert: {insert_error}")
         return {"status": "error", "message": str(insert_error)}
-
