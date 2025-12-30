@@ -598,6 +598,7 @@ async def webhook_events(request: Request):
 
     rows = []
     rows_to_insert = []
+    links_to_create = []  # NEW: Track links to create in junction table
 
     # ---- Process events ----
     for event in events:
@@ -628,7 +629,7 @@ async def webhook_events(request: Request):
             "status": "final",
             "category_ai_id": event["category_id"],
             "category_user_id": None,
-            "statement_import_id": event.get("file_id"),  # ✅ Store file_id for tracking
+            "statement_import_id": event.get("file_id"),  # Keep for backward compatibility
             "occurred_at": occurred_at,
         }
         
@@ -639,14 +640,16 @@ async def webhook_events(request: Request):
         logger.info("No rows to insert")
         return {"status": "no events"}
 
-    # ✅ UPDATED: GLOBAL deduplication - Check across ALL statement files
+    # UPDATED: GLOBAL deduplication - Check across ALL statement files
     # This prevents duplicate transactions when users upload overlapping statements
     logger.info(f"Checking for duplicates among {len(rows)} transactions (GLOBAL check across all files)")
     
+    file_id = rows[0].get("statement_import_id") if rows else None  # Get file_id from first row (all should have same file_id)
+    
     for row in rows:
-        file_id = row.get("statement_import_id")
+        current_file_id = row.get("statement_import_id")
         
-        # ✅ KEY CHANGE: Check for duplicates GLOBALLY (remove file_id filter)
+        # KEY CHANGE: Check for duplicates GLOBALLY (remove file_id filter)
         # Match by: user_id, raw_description, amount, occurred_at, source
         # This ensures the same transaction from different statement files is only stored once
         query = supabase.table("transactions").select("id, category_ai_id, category_user_id, statement_import_id").eq("user_id", row["user_id"]).eq("raw_description", row["raw_description"]).eq("amount", row["amount"]).eq("occurred_at", row["occurred_at"]).eq("source", "statement")
@@ -659,14 +662,23 @@ async def webhook_events(request: Request):
             existing_file_id = existing.data[0].get("statement_import_id")
             
             # Log whether it's from the same file or different file
-            if existing_file_id == file_id:
-                logger.info(f"⚠️ Duplicate transaction found from SAME file (ID: {existing_id}, file_id: {file_id}). Skipping insertion.")
+            if existing_file_id == current_file_id:
+                logger.info(f"⚠️ Duplicate transaction found from SAME file (ID: {existing_id}, file_id: {current_file_id}). Skipping insertion.")
             else:
-                logger.info(f"⚠️ Duplicate transaction found from DIFFERENT file (ID: {existing_id}, existing_file_id: {existing_file_id}, new_file_id: {file_id}). Skipping insertion.")
+                logger.info(f"⚠️ Duplicate transaction found from DIFFERENT file (ID: {existing_id}, existing_file_id: {existing_file_id}, new_file_id: {current_file_id}). Creating link in junction table.")
             
             logger.info(f"   Details: {row['raw_description'][:50]}... | Amount: {row['amount']} | Date: {row['occurred_at']}")
             
-            # ✅ OPTIONAL: Update existing transaction if category_ai_id changed
+            # NEW: Create link in junction table (even if duplicate from different file)
+            # This ensures the statement can find all its transactions
+            if current_file_id:
+                links_to_create.append({
+                    "statement_import_id": current_file_id,
+                    "transaction_id": existing_id
+                })
+                logger.info(f"Added link: statement {current_file_id} -> transaction {existing_id}")
+            
+            # OPTIONAL: Update existing transaction if category_ai_id changed
             # Only update if category_ai_id is different and category_user_id is still null
             # (Don't overwrite user's manual category assignment)
             try:
@@ -687,26 +699,65 @@ async def webhook_events(request: Request):
             # Transaction doesn't exist globally - add to insert list
             rows_to_insert.append(row)
 
-    # Only insert new transactions
-    if not rows_to_insert:
-        logger.info("All transactions already exist. No new transactions to insert.")
-        return {"status": "success", "message": "All transactions already exist", "skipped": len(rows), "inserted": 0}
-
-    logger.info(f"Inserting {len(rows_to_insert)} new transactions (skipped {len(rows) - len(rows_to_insert)} duplicates)")
+    # NEW: Insert new transactions and create links
+    inserted_transaction_ids = []
     
-    try:
-        resp = supabase.table("transactions").insert(rows_to_insert).execute()
-        logger.info(f"✅ Successfully inserted {len(rows_to_insert)} transactions")
+    if rows_to_insert:
+        logger.info(f"Inserting {len(rows_to_insert)} new transactions (skipped {len(rows) - len(rows_to_insert)} duplicates)")
         
-        if resp.get("error"):
-            logger.error("Failed to insert transactions: %s", resp["error"])
-            return {"status": "error", "message": str(resp["error"])}
-        
-        return {
-            "status": "success",
-            "inserted": len(rows_to_insert),
-            "skipped": len(rows) - len(rows_to_insert)
-        }
-    except Exception as insert_error:
-        logger.error(f"Exception during insert: {insert_error}")
-        return {"status": "error", "message": str(insert_error)}
+        try:
+            resp = supabase.table("transactions").insert(rows_to_insert).execute()
+            logger.info(f"Successfully inserted {len(rows_to_insert)} transactions")
+            
+            if resp.get("error"):
+                logger.error("Failed to insert transactions: %s", resp["error"])
+                return {"status": "error", "message": str(resp["error"])}
+            
+            # Extract IDs of newly inserted transactions
+            if resp.data:
+                inserted_transaction_ids = [tx["id"] for tx in resp.data]
+                
+                # Create links for newly inserted transactions
+                for i, row in enumerate(rows_to_insert):
+                    if row.get("statement_import_id") and i < len(inserted_transaction_ids):
+                        links_to_create.append({
+                            "statement_import_id": row.get("statement_import_id"),
+                            "transaction_id": inserted_transaction_ids[i]
+                        })
+                        logger.info(f"Added link: statement {row.get('statement_import_id')} -> transaction {inserted_transaction_ids[i]}")
+            
+        except Exception as insert_error:
+            logger.error(f"Exception during insert: {insert_error}")
+            return {"status": "error", "message": str(insert_error)}
+    else:
+        logger.info("All transactions already exist. No new transactions to insert.")
+
+    # NEW: Create all links in junction table
+    if links_to_create:
+        logger.info(f"Creating {len(links_to_create)} links in statement_transactions junction table")
+        try:
+            # Use upsert to handle duplicate links gracefully (UNIQUE constraint)
+            for link in links_to_create:
+                try:
+                    supabase.table("statement_transactions").upsert(
+                        link,
+                        on_conflict="statement_import_id,transaction_id"
+                    ).execute()
+                    logger.info(f"Created link: statement {link['statement_import_id']} -> transaction {link['transaction_id']}")
+                except Exception as link_error:
+                    # Link might already exist (from previous processing), that's OK
+                    logger.debug(f"Link already exists or error creating link: {link_error}")
+            
+            logger.info(f"Successfully created {len(links_to_create)} links in junction table")
+        except Exception as link_error:
+            logger.warning(f"⚠️ Some links could not be created: {link_error}")
+            # Don't fail the entire operation if link creation fails
+            # The transactions are still inserted/updated
+
+    return {
+        "status": "success",
+        "inserted": len(rows_to_insert),
+        "skipped": len(rows) - len(rows_to_insert),
+        "links_created": len(links_to_create)
+    }
+
